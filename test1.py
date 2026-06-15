@@ -1,0 +1,1 @@
+print("Ciao Alberto, Python sta girando dal venv iso_venv.")
