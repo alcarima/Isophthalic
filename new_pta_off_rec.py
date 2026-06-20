@@ -2,6 +2,8 @@ import math
 import os
 import tkinter as tk
 import ollama
+import sqlite3
+from datetime import datetime
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 #import asyncio
 import threading
@@ -520,14 +522,153 @@ def solve_reactor(
 
 
 # =======================================================
-# PATH IMAGE
+# PATH IMAGE AND DATABASE
 # =======================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMG_PATH = os.path.join(BASE_DIR, "isophthalic_acid.png")
+DB_PATH = os.path.join(BASE_DIR, "glass_plant_history.db")
 
 print("IMG_PATH used:", IMG_PATH)
 print("File exists?", os.path.exists(IMG_PATH))
+print("DB_PATH used:", DB_PATH)
 
+
+# =======================================================
+# DATABASE SETUP
+# =======================================================
+def init_database():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS process_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+
+            mx_feed REAL,
+            hac_feed REAL,
+            water_feed REAL,
+
+            reactor_pressure REAL,
+            reactor_temperature REAL,
+
+            hp_steam REAL,
+            lp_steam REAL,
+
+            cond1_temperature REAL,
+            cond2_temperature REAL,
+
+            hac_to_scrubber REAL,
+            water_to_scrubber REAL,
+
+            water_to_crystallizer REAL,
+            hac_to_crystallizer REAL,
+            ia_to_crystallizer REAL,
+
+            thickness_index REAL,
+            thickness_status TEXT,
+
+            offgas_o2_percent REAL,
+            offgas_co2_percent REAL,
+
+            residual_heat REAL,
+            dcs_simulation TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+def save_process_snapshot(
+    mx_value,
+    mves,
+    cond_1,
+    cond_2,
+    reactor_temp,
+    react_pressure_barg,
+    hp_steam,
+    lp_steam,
+    ia_react_out_wat,
+    ia_react_out_HAc,
+    ia_react_out_IA,
+    thickness_index,
+    thickness_status,
+    ia_remaining_heat,
+):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO process_history (
+            timestamp,
+
+            mx_feed,
+            hac_feed,
+            water_feed,
+
+            reactor_pressure,
+            reactor_temperature,
+
+            hp_steam,
+            lp_steam,
+
+            cond1_temperature,
+            cond2_temperature,
+
+            hac_to_scrubber,
+            water_to_scrubber,
+
+            water_to_crystallizer,
+            hac_to_crystallizer,
+            ia_to_crystallizer,
+
+            thickness_index,
+            thickness_status,
+
+            offgas_o2_percent,
+            offgas_co2_percent,
+
+            residual_heat,
+            dcs_simulation
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+
+        mx_value,
+        mves["hac_flow_to_rx_kg_h"],
+        mves["water_flow_to_rx_kg_h"],
+
+        react_pressure_barg,
+        reactor_temp,
+
+        hp_steam,
+        lp_steam,
+
+        cond_1["condenser_1_exit_temp"],
+        cond_2["condenser_2_exit_temp"],
+
+        cond_2["condenser_2_vap_hac_kg_h"],
+        cond_2["condenser_2_vap_wat_kg_h"],
+
+        ia_react_out_wat,
+        ia_react_out_HAc,
+        ia_react_out_IA,
+
+        thickness_index,
+        thickness_status,
+
+        dcs_o2_offgas_percent,
+        dcs_co2_offgas_percent,
+
+        ia_remaining_heat,
+        "ON" if dcs_simulation_running else "OFF",
+    ))
+
+    conn.commit()
+    conn.close()
+
+init_database()
 
 # =======================================================
 # UI TKINTER
@@ -947,6 +1088,12 @@ dcs_next_time = None
 dcs_o2_offgas_percent = 3.2
 dcs_co2_offgas_percent = 2.1
 
+# Database logging frequency
+
+last_db_save_time = 0
+
+DB_SAVE_INTERVAL_SECONDS = 10
+
 def simulate_dcs_feed():
     global dcs_feed_high, dcs_after_id, dcs_next_time
     global dcs_o2_offgas_percent, dcs_co2_offgas_percent
@@ -1096,7 +1243,7 @@ Give:
 # UPDATE MODEL
 # =======================================================
 def update_model(val=None):
-    global initializing
+    global initializing, last_db_save_time
 
     if initializing:
         return
@@ -1169,13 +1316,38 @@ def update_model(val=None):
     )
 
     if 0.740 <= thickness_index <= 0.780:
+        thickness_status = "OK"
         op_msg = "Thickness index OK"
     elif 0.780 < thickness_index <= 0.785:
+        thickness_status = "WARNING"
         op_msg = "Thickness index WARNING.\nCheck crystallizer feed dilution."
     else:
+        thickness_status = "NOT OK"
         op_msg = "Thickness index NOT OK.\nCheck dilution / crystallizer feed."
 
     operators_text.config(text=op_msg)
+
+    now = time.monotonic()
+
+    if now - last_db_save_time >= DB_SAVE_INTERVAL_SECONDS:
+        save_process_snapshot(
+            mx_value,
+            mves,
+            cond_1,
+            cond_2,
+            reactor_temp,
+            react_pressure_barg,
+            hp_steam,
+            lp_steam,
+            ia_react_out_wat,
+            ia_react_out_HAc,
+            ia_react_out_IA,
+            thickness_index,
+            thickness_status,
+            ia_remaining_heat,
+        )
+
+    last_db_save_time = now
 
     overlay = make_overlay_image(
         mves,
@@ -1404,6 +1576,68 @@ def test_ai_button():
     print("TEST BUTTON PRESSED", flush=True)
 
     set_ai_text("Test OK: AI button is working.")
+
+# =======================================================
+# HISTORY WINDOW
+# =======================================================
+def open_history_window():
+    hist_win = tk.Toplevel(root)
+    hist_win.title("Glass Plant Historical Data")
+    hist_win.geometry("950x500")
+
+    text = tk.Text(
+        hist_win,
+        bg="white",
+        fg="black",
+        font=("Courier", 10),
+        wrap="none"
+    )
+
+    text.pack(fill="both", expand=True)
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT 
+            timestamp,
+            mx_feed,
+            reactor_temperature,
+            thickness_index,
+            thickness_status,
+            offgas_o2_percent,
+            offgas_co2_percent
+        FROM process_history
+        ORDER BY timestamp DESC
+        LIMIT 100
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    text.insert(
+        "end",
+        "Timestamp              MX feed   T reactor   Thick idx   Status     O2%    CO2%\n"
+    )
+
+    text.insert(
+        "end",
+        "-" * 85 + "\n"
+    )
+
+    for row in rows:
+        timestamp, mx_feed, reactor_temp, thickness_index, status, o2, co2 = row
+
+        text.insert(
+            "end",
+            f"{timestamp}  "
+            f"{mx_feed:8.0f}  "
+            f"{reactor_temp:9.1f}  "
+            f"{thickness_index:9.3f}  "
+            f"{status:8s}  "
+            f"{o2:5.1f}  "
+            f"{co2:5.1f}\n"
+        )    
 # =======================================================
 # CONTROLS
 # =======================================================
@@ -1569,6 +1803,17 @@ stop_dcs_btn = tk.Button(
     font=("Arial", 11)
 )
 stop_dcs_btn.pack(fill="x", padx=12, pady=4)
+
+history_btn = tk.Button(
+    controls,
+    text="Open history",
+    command=open_history_window,
+    bg="#444",
+    fg="white",
+    font=("Arial", 11)
+)
+
+history_btn.pack(fill="x", padx=12, pady=4)
 # -------------------------------------------------------
 # Result label
 # -------------------------------------------------------
